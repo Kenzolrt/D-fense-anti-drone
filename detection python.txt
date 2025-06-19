@@ -1,0 +1,96 @@
+import cv2
+import numpy as np
+import serial
+import time
+import math
+
+# Connexion à l'Arduino (modifie COM3 si besoin)
+arduino = serial.Serial('COM3', 9600)
+time.sleep(2)  # Laisse le temps à l'Arduino de démarrer
+
+# Paramètres caméra et objet
+cap = cv2.VideoCapture(0)
+bg_subtractor = cv2.createBackgroundSubtractorMOG2()
+
+DRONE_REAL_WIDTH = 40  # cm
+FOCAL_LENGTH = 700     # à ajuster selon ta caméra
+FPS = 30
+dt = 1 / FPS
+T0 = 5  # pour le facteur temporel dans le calcul des angles
+
+# Stockage des positions, vitesses et angles
+positions = []
+vitesses = []
+angles = []
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Détection par soustraction de fond
+    fg_mask = bg_subtractor.apply(frame)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        x, y, L, H = cv2.boundingRect(c)
+
+        if L > 20 and H > 20:
+            cx = x + L // 2
+            cy = y + H // 2
+            Z = (FOCAL_LENGTH * DRONE_REAL_WIDTH) / L  # profondeur estimée
+
+            current_pos = (cx, cy, Z)
+            positions.append(current_pos)
+
+            if len(positions) >= 2:
+                x0, y0, z0 = positions[-2]
+                x1, y1, z1 = current_pos
+
+                vx = (x1 - x0) / dt
+                vy = (y1 - y0) / dt
+                vz = (z1 - z0) / dt
+
+                vitesses.append((vx, vy, vz))
+
+                i = len(vitesses) - 1
+                facteur_temps = T0 - i / FPS
+                vx_t = vx * facteur_temps
+                vy_t = vy * facteur_temps
+                vz_t = vz * facteur_temps
+
+                theta = math.atan2(vz_t, vx_t)  # angle horizontal
+                phi = math.atan2(math.sqrt(vx_t**2 + vz_t**2), vy_t)  # élévation
+
+                angles.append((theta, phi))
+
+                # Envoi des commandes au moteur
+                try:
+                    arduino.write(f"SET THETA {theta:.4f}\n".encode())
+                    time.sleep(0.01)
+                    arduino.write(f"SET PHI {phi:.4f}\n".encode())
+                except Exception as e:
+                    print("Erreur série:", e)
+
+                # Affichage à l'écran
+                cv2.putText(frame, f"Theta: {int(math.degrees(theta))} deg", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+                cv2.putText(frame, f"Phi: {int(math.degrees(phi))} deg", (20, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+
+            # Dessiner le rectangle de détection
+            cv2.rectangle(frame, (x, y), (x + L, y + H), (0, 255, 0), 2)
+
+    # Affichage
+    cv2.imshow("Drone Tracking", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Libération des ressources
+cap.release()
+arduino.close()
+cv2.destroyAllWindows()
